@@ -1,0 +1,19 @@
+# Environment variables — never commit real API keys
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+*.egg-info/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+
+# Prophet/cmdstanpy artifacts
+*.pkl
+/tests
