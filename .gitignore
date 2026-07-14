@@ -17,3 +17,5 @@ venv/
 # Prophet/cmdstanpy artifacts
 *.pkl
 /tests
+/.env
+/.env.example
