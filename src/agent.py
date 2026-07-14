@@ -46,7 +46,18 @@ def build_primary_llm():
 def build_fallback_llm():
     from langchain_google_genai import ChatGoogleGenerativeAI
     return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        # "gemini-flash-latest" is Google's auto-updating alias — it always
+        # points to their current-generation Flash model, hot-swapped by
+        # Google on every release. We use it deliberately instead of a
+        # pinned version string (e.g. "gemini-2.5-flash") after hitting a
+        # real 404 in testing: Google retired that pinned model for new
+        # users within months of this project being built. A fallback
+        # provider that itself needs manual updates defeats the point of
+        # having a fallback — the alias avoids that failure mode going
+        # forward. Trade-off: Google could change behavior/pricing under
+        # you between releases; pin to a specific version instead if you
+        # need that guarantee for a production system.
+        model="gemini-flash-latest",
         google_api_key=os.environ.get("GOOGLE_API_KEY") or "not-set",
         temperature=0.1,
     )

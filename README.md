@@ -179,6 +179,19 @@ The Streamlit chat tab surfaces which provider actually answered whenever a
 fallback occurs, so the switch is visible rather than silent — useful both
 for debugging and for demonstrating the resilience pattern live.
 
+**Second implementation note — model string pinning.** `build_fallback_llm()`
+uses `"gemini-flash-latest"` rather than a specific pinned version like
+`"gemini-2.5-flash"`. This is a deliberate choice made after hitting a real
+404 during testing: Google retired that pinned model for new users within
+months of this project being built. Google publishes auto-updating aliases
+(`-latest`) specifically for this reason — they get hot-swapped to Google's
+current-generation model on every release, so a *fallback* provider doesn't
+itself need manual maintenance to keep working. The trade-off is that
+behavior and pricing can shift under you between Google's releases; pin to
+an exact version string instead if you need that guarantee for a production
+system. For a portfolio/demo project prioritizing "it keeps working without
+me touching it," the alias is the better choice.
+
 Neither provider requires a credit card. Get your keys at the links above, then:
 
 ```bash
