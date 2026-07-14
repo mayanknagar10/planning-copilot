@@ -147,14 +147,37 @@ This project runs entirely on free-tier LLM APIs — no cost to build or demo.
 `meta-llama/llama-3.3-70b-instruct:free`, which supports tool calling.
 
 **Fallback: [Google AI Studio (Gemini)](https://ai.google.dev)** — kicks in
-automatically if OpenRouter is rate-limited or unavailable, via LangChain's
-`.with_fallbacks()`. This isn't just a workaround for free-tier limits — it's the
-same primary/fallback LLM-gateway pattern used in production systems, and it's
-demoed live in this project rather than just described.
+automatically if OpenRouter is rate-limited or unavailable. This isn't just a
+workaround for free-tier limits — it's the same primary/fallback LLM-gateway
+pattern used in production systems, and it's demoed live in this project
+rather than just described.
+
+**Implementation note — worth reading if you're extending this file.**
+Fallback is handled by trying a complete primary agent, catching any
+exception, and retrying on a complete fallback agent (see
+`invoke_agent_with_fallback()` in `agent.py`) — not LangChain's built-in
+`.with_fallbacks()`. That method wraps a raw chat model, but `create_react_agent`
+needs to call `.bind_tools()` on the model to enable tool calling, and
+`RunnableWithFallbacks` doesn't reliably propagate `.bind_tools()` through to
+the wrapped fallback model. In practice that means the fallback silently
+doesn't get tools bound, so a rate-limited primary surfaces its original
+error instead of failing over — exactly the bug this project hit during
+testing. Building two complete agents and catching the failure at the agent
+invocation level sidesteps the issue entirely.
 
 ```python
-llm = primary.with_fallbacks([fallback])
+def invoke_agent_with_fallback(question: str) -> dict:
+    try:
+        primary_agent = create_react_agent(build_primary_llm(), TOOLS, prompt=SYSTEM_PROMPT)
+        return {"result": primary_agent.invoke(...), "provider": "OpenRouter", "fell_back": False}
+    except Exception:
+        fallback_agent = create_react_agent(build_fallback_llm(), TOOLS, prompt=SYSTEM_PROMPT)
+        return {"result": fallback_agent.invoke(...), "provider": "Gemini", "fell_back": True}
 ```
+
+The Streamlit chat tab surfaces which provider actually answered whenever a
+fallback occurs, so the switch is visible rather than silent — useful both
+for debugging and for demonstrating the resilience pattern live.
 
 Neither provider requires a credit card. Get your keys at the links above, then:
 
@@ -162,6 +185,13 @@ Neither provider requires a credit card. Get your keys at the links above, then:
 cp .env.example .env
 # fill in OPENROUTER_API_KEY and (optionally) GOOGLE_API_KEY
 ```
+
+**Important:** `.env` is where your real keys go — `.env.example` is only a
+committed template with empty placeholders. `.env` is already listed in
+`.gitignore`, so your real keys never get pushed to GitHub. Also note that
+`.env` needs `load_dotenv()` to actually be read into the environment — this
+project calls it at the top of `app.py`, `agent.py`, and `mcp_server.py`, so
+you don't need to do anything extra beyond filling in the file.
 
 ## Getting started
 

@@ -34,25 +34,34 @@ from knowledge_base import PlanningKnowledgeBase
 
 # ── LLM setup: primary + fallback ────────────────────────────────────────────
 
-def build_llm():
-    primary = ChatOpenAI(
+def build_primary_llm():
+    return ChatOpenAI(
         model="meta-llama/llama-3.3-70b-instruct:free",
         base_url="https://openrouter.ai/api/v1",
         api_key=os.environ.get("OPENROUTER_API_KEY") or "not-set",
         temperature=0.1,  # low temperature: this is a planning tool, not creative writing
     )
 
-    try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        fallback = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            google_api_key=os.environ.get("GOOGLE_API_KEY") or "not-set",
-            temperature=0.1,
-        )
-        return primary.with_fallbacks([fallback])
-    except Exception:
-        # Fallback provider not configured — run on primary only.
-        return primary
+
+def build_fallback_llm():
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=os.environ.get("GOOGLE_API_KEY") or "not-set",
+        temperature=0.1,
+    )
+
+
+# NOTE on why fallback is handled manually, not via LangChain's
+# `.with_fallbacks()`: that mechanism wraps a chat model at the raw-LLM
+# level, but `create_react_agent` needs to call `.bind_tools()` on the model
+# to enable tool calling — and `RunnableWithFallbacks` doesn't reliably
+# propagate `.bind_tools()` through to the wrapped fallback model. In
+# practice this means the fallback silently doesn't get tools bound, so a
+# rate-limited primary provider surfaces its original error instead of
+# failing over. Building two complete agents and catching the failure at
+# the *agent invocation* level (see invoke_agent_with_fallback below)
+# sidesteps this entirely and is the reliable pattern for agent+fallback.
 
 
 # ── Tools: the ONLY way the agent can produce a number ───────────────────────
@@ -203,17 +212,48 @@ Your tone is that of a sharp, no-nonsense planning analyst — clear, numbers-fi
 never salesy or overly enthusiastic."""
 
 
-def build_agent():
-    llm = build_llm()
-    agent = create_react_agent(llm, TOOLS, prompt=SYSTEM_PROMPT)
-    return agent
+def build_agent(use_fallback: bool = False):
+    """
+    Builds a single agent on one provider. Kept for callers that only need
+    one provider (e.g. simple scripts). For the reliable primary→fallback
+    behavior, use invoke_agent_with_fallback() instead — see note above.
+    """
+    llm = build_fallback_llm() if use_fallback else build_primary_llm()
+    return create_react_agent(llm, TOOLS, prompt=SYSTEM_PROMPT)
+
+
+def invoke_agent_with_fallback(question: str) -> dict:
+    """
+    Tries the primary provider (OpenRouter) first; if it raises for any
+    reason (rate limit, timeout, auth error), transparently retries on the
+    fallback provider (Gemini) with a fresh agent. Returns a dict with the
+    full LangGraph result (so app.py can still extract the tool-call trace)
+    plus which provider actually answered, for UI transparency.
+    """
+    messages = {"messages": [HumanMessage(content=question)]}
+
+    try:
+        primary_agent = create_react_agent(build_primary_llm(), TOOLS, prompt=SYSTEM_PROMPT)
+        result = primary_agent.invoke(messages)
+        return {"result": result, "provider": "OpenRouter (Llama 3.3 70B)", "fell_back": False}
+    except Exception as primary_error:
+        try:
+            fallback_agent = create_react_agent(build_fallback_llm(), TOOLS, prompt=SYSTEM_PROMPT)
+            result = fallback_agent.invoke(messages)
+            return {"result": result, "provider": "Google Gemini 2.5 Flash (fallback)", "fell_back": True}
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"Both LLM providers failed.\n"
+                f"Primary (OpenRouter) error: {primary_error}\n"
+                f"Fallback (Gemini) error: {fallback_error}\n"
+                f"Check both OPENROUTER_API_KEY and GOOGLE_API_KEY in .env."
+            )
 
 
 def ask(question: str) -> str:
-    """Convenience function for one-off questions (used by the Streamlit app)."""
-    agent = build_agent()
-    result = agent.invoke({"messages": [HumanMessage(content=question)]})
-    return result["messages"][-1].content
+    """Convenience function for one-off questions — uses the primary→fallback chain."""
+    response = invoke_agent_with_fallback(question)
+    return response["result"]["messages"][-1].content
 
 
 if __name__ == "__main__":

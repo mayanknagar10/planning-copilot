@@ -178,11 +178,14 @@ with tab2:
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
+                fell_back = False
+                provider_used = None
                 try:
                     agent_module = get_agent_module()
-                    agent = agent_module.build_agent()
-                    from langchain_core.messages import HumanMessage
-                    result = agent.invoke({"messages": [HumanMessage(content=question)]})
+                    response = agent_module.invoke_agent_with_fallback(question)
+                    result = response["result"]
+                    provider_used = response["provider"]
+                    fell_back = response["fell_back"]
                     answer = result["messages"][-1].content
 
                     # Extract tool calls for the trace panel
@@ -195,9 +198,14 @@ with tab2:
                     answer = f"Error calling the LLM provider: {e}\n\nCheck your API keys in .env."
                     tool_calls_made = []
 
+                if fell_back:
+                    st.caption(f"⚡ Primary provider was rate-limited — answered via {provider_used}")
+
                 st.markdown(answer)
                 if tool_calls_made:
                     with st.expander("🔍 Trace — tool calls behind this answer"):
+                        if provider_used:
+                            st.caption(f"Answered by: {provider_used}")
                         for tc in tool_calls_made:
                             st.code(f"{tc['tool']}() → {tc['output']}", language="json")
 
