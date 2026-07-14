@@ -25,6 +25,11 @@ Or configure in Claude Desktop's claude_desktop_config.json (see README):
 import json
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
+from dotenv import load_dotenv
+
+load_dotenv()  # Claude Desktop launches this as a subprocess with its own
+                # environment — this ensures .env is read regardless of how
+                # the process was started.
 
 from forecast_engine import DemandForecastEngine
 from knowledge_base import PlanningKnowledgeBase

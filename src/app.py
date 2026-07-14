@@ -15,6 +15,9 @@ import json
 import streamlit as st
 import plotly.graph_objects as go
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env into os.environ — must run before checking API keys below
 
 sys.path.insert(0, str(Path(__file__).parent))
 

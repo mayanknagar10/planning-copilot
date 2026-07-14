@@ -25,6 +25,9 @@ from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env into os.environ — needed when agent.py is run/imported standalone
 
 from forecast_engine import DemandForecastEngine
 from knowledge_base import PlanningKnowledgeBase
