@@ -143,11 +143,14 @@ cd src && python3 mcp_server.py
 
 This project runs entirely on free-tier LLM APIs — no cost to build or demo.
 
-**Primary: [OpenRouter](https://openrouter.ai)** — one API key, routes to
-`meta-llama/llama-3.3-70b-instruct:free`, which supports tool calling.
+**Primary: [Groq](https://console.groq.com/keys)** — one API key, routes to
+`llama-3.3-70b-versatile`. Groq serves open-weight models on custom LPU
+hardware rather than GPUs, so responses come back dramatically faster than
+typical free-tier LLM APIs; its free tier is a persistent rate-limited
+allowance (not a trial that expires), and it supports tool calling.
 
 **Fallback: [Google AI Studio (Gemini)](https://ai.google.dev)** — kicks in
-automatically if OpenRouter is rate-limited or unavailable. This isn't just a
+automatically if Groq is rate-limited or unavailable. This isn't just a
 workaround for free-tier limits — it's the same primary/fallback LLM-gateway
 pattern used in production systems, and it's demoed live in this project
 rather than just described.
@@ -163,19 +166,25 @@ the wrapped fallback model. In practice that means the fallback silently
 doesn't get tools bound, so a rate-limited primary surfaces its original
 error instead of failing over — exactly the bug this project hit during
 testing. Building two complete agents and catching the failure at the agent
-invocation level sidesteps the issue entirely.
+invocation level sidesteps the issue entirely. The same primary→fallback
+pattern is used again for streaming — see `stream_agent_with_fallback()`,
+which yields answer text token-by-token instead of blocking for the full
+response, falling back to Gemini mid-generator if Groq raises before
+streaming any tokens (the common case: auth/rate-limit errors surface
+immediately, before the first chunk).
 
 ```python
 def invoke_agent_with_fallback(question: str) -> dict:
     try:
         primary_agent = create_react_agent(build_primary_llm(), TOOLS, prompt=SYSTEM_PROMPT)
-        return {"result": primary_agent.invoke(...), "provider": "OpenRouter", "fell_back": False}
+        return {"result": primary_agent.invoke(...), "provider": "Groq", "fell_back": False}
     except Exception:
         fallback_agent = create_react_agent(build_fallback_llm(), TOOLS, prompt=SYSTEM_PROMPT)
         return {"result": fallback_agent.invoke(...), "provider": "Gemini", "fell_back": True}
 ```
 
-The Streamlit chat tab surfaces which provider actually answered whenever a
+The Streamlit chat tab streams the answer token-by-token and surfaces which
+provider actually answered (plus response latency and token usage) whenever a
 fallback occurs, so the switch is visible rather than silent — useful both
 for debugging and for demonstrating the resilience pattern live.
 
@@ -192,19 +201,20 @@ an exact version string instead if you need that guarantee for a production
 system. For a portfolio/demo project prioritizing "it keeps working without
 me touching it," the alias is the better choice.
 
-Neither provider requires a credit card. Get your keys at the links above, then:
+Neither provider requires a credit card. Get your keys at the links above, then
+create a `.env` file in the project root with:
 
 ```bash
-cp .env.example .env
-# fill in OPENROUTER_API_KEY and (optionally) GOOGLE_API_KEY
+GROQ_API_KEY=your-key-here
+GOOGLE_API_KEY=your-key-here   # optional — only needed for the fallback path
 ```
 
-**Important:** `.env` is where your real keys go — `.env.example` is only a
-committed template with empty placeholders. `.env` is already listed in
-`.gitignore`, so your real keys never get pushed to GitHub. Also note that
-`.env` needs `load_dotenv()` to actually be read into the environment — this
-project calls it at the top of `app.py`, `agent.py`, and `mcp_server.py`, so
-you don't need to do anything extra beyond filling in the file.
+**Important:** `.env` is already listed in `.gitignore` (along with
+`.env.example`, should you choose to add one), so your real keys never get
+pushed to GitHub. Also note that `.env` needs `load_dotenv()` to actually be
+read into the environment — this project calls it at the top of `app.py`,
+`agent.py`, and `mcp_server.py`, so you don't need to do anything extra beyond
+creating the file.
 
 ## Getting started
 
@@ -212,14 +222,16 @@ you don't need to do anything extra beyond filling in the file.
 # 1. Clone and set up environment
 git clone <your-repo-url>
 cd planning-copilot
-python3 -m venv venv && source venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate        # macOS/Linux
+# venv\Scripts\activate          # Windows (cmd/PowerShell)
 pip install -r requirements.txt
 
 # 2. Generate the synthetic demand dataset
 cd data && python3 generate_data.py && cd ..
 
-# 3. Set up API keys (see above)
-cp .env.example .env   # then fill in your keys
+# 3. Set up API keys (see above) — create a .env file in the project root
+#    with GROQ_API_KEY and (optionally) GOOGLE_API_KEY
 
 # 4. Run the test suite (no API keys needed — tests only the deterministic core)
 pytest tests/ -v
@@ -231,11 +243,14 @@ cd src && streamlit run app.py
 cd src && python3 mcp_server.py
 ```
 
+On Windows, use `python` instead of `python3` if your Python install doesn't
+expose a `python3` alias.
+
 The **Forecast Explorer** tab works immediately with no API keys — it only calls
 `forecast_engine.py` directly. The related-notes panel and the **Planning Assistant**
 chat tab both use `knowledge_base.py`, which needs one internet connection on first
 use to download the local embedding model (~90MB, one-time only) — after that it
-runs fully offline. The chat tab additionally needs `OPENROUTER_API_KEY` set for the
+runs fully offline. The chat tab additionally needs `GROQ_API_KEY` set for the
 LLM narration layer. The **MCP server** needs no API keys to run itself — it's the
 LLM client (Claude Desktop, etc.) connecting to it that provides the reasoning layer.
 
@@ -274,9 +289,10 @@ planning-copilot/
 │   ├── app.py                  # Streamlit dashboard — Forecast Explorer + chat
 │   └── chroma_db/              # persisted vector index (auto-created on first run)
 ├── tests/
-│   └── test_forecast_engine.py  # unit tests for the deterministic core
+│   ├── test_forecast_engine.py  # unit tests for the deterministic core
+│   └── test_knowledge_base.py   # unit tests for retrieval (uses tfidf mode, no download)
 ├── requirements.txt
-├── .env.example
+├── .env                         # you create this — see "LLM provider setup" above
 └── README.md
 ```
 

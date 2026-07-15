@@ -13,18 +13,19 @@ This separation is what makes the system trustworthy for planning decisions —
 an LLM "estimating" a demand number would be actively dangerous in this
 context, since a wrong number silently propagates into a real inventory order.
 
-Provider setup: primary model via OpenRouter, automatic fallback to Google
-Gemini if OpenRouter is rate-limited or unavailable. Both are OpenAI-compatible
-or LangChain-native, so swapping either is a one-line change.
+Provider setup: primary model via Groq (free, open-weight Llama models served
+on Groq's LPU hardware — fast, generous rate limits, no credit card), automatic
+fallback to Google Gemini if Groq is rate-limited or unavailable. Both are
+LangChain-native chat models, so swapping either is a one-line change.
 """
 
 import os
 import json
 from typing import Optional
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.prebuilt import create_react_agent
-from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 
 load_dotenv()  # reads .env into os.environ — needed when agent.py is run/imported standalone
@@ -35,10 +36,9 @@ from knowledge_base import PlanningKnowledgeBase
 # ── LLM setup: primary + fallback ────────────────────────────────────────────
 
 def build_primary_llm():
-    return ChatOpenAI(
-        model="meta-llama/llama-3.3-70b-instruct:free",
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.environ.get("OPENROUTER_API_KEY") or "not-set",
+    return ChatGroq(
+        model="llama-3.3-70b-versatile",
+        api_key=os.environ.get("GROQ_API_KEY") or "not-set",
         temperature=0.1,  # low temperature: this is a planning tool, not creative writing
     )
 
@@ -193,6 +193,25 @@ def search_planning_notes(query: str, category_filter: Optional[str] = None) -> 
 TOOLS = [list_available_skus, get_forecast, run_what_if_scenario, check_demand_exception, search_planning_notes]
 
 
+def extract_message_text(message) -> str:
+    """
+    Normalizes a LangChain message's `.content` into plain text. Most
+    providers (Groq/Llama) return a plain string, but Gemini returns a
+    list of content blocks (e.g. `[{"type": "text", "text": "...", "extras":
+    {"signature": "..."}}]`) — without this, the raw block list (signature
+    and all) gets displayed to the planner verbatim.
+    """
+    content = message.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "") for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(content)
+
+
 SYSTEM_PROMPT = """You are PlanningCopilot, an AI assistant for supply chain planners.
 
 Your job is to help planners understand demand forecasts, run what-if scenarios,
@@ -235,18 +254,18 @@ def build_agent(use_fallback: bool = False):
 
 def invoke_agent_with_fallback(question: str) -> dict:
     """
-    Tries the primary provider (OpenRouter) first; if it raises for any
-    reason (rate limit, timeout, auth error), transparently retries on the
-    fallback provider (Gemini) with a fresh agent. Returns a dict with the
-    full LangGraph result (so app.py can still extract the tool-call trace)
-    plus which provider actually answered, for UI transparency.
+    Tries the primary provider (Groq) first; if it raises for any reason
+    (rate limit, timeout, auth error), transparently retries on the fallback
+    provider (Gemini) with a fresh agent. Returns a dict with the full
+    LangGraph result (so app.py can still extract the tool-call trace) plus
+    which provider actually answered, for UI transparency.
     """
     messages = {"messages": [HumanMessage(content=question)]}
 
     try:
         primary_agent = create_react_agent(build_primary_llm(), TOOLS, prompt=SYSTEM_PROMPT)
         result = primary_agent.invoke(messages)
-        return {"result": result, "provider": "OpenRouter (Llama 3.3 70B)", "fell_back": False}
+        return {"result": result, "provider": "Groq (Llama 3.3 70B)", "fell_back": False}
     except Exception as primary_error:
         try:
             fallback_agent = create_react_agent(build_fallback_llm(), TOOLS, prompt=SYSTEM_PROMPT)
@@ -255,20 +274,68 @@ def invoke_agent_with_fallback(question: str) -> dict:
         except Exception as fallback_error:
             raise RuntimeError(
                 f"Both LLM providers failed.\n"
-                f"Primary (OpenRouter) error: {primary_error}\n"
+                f"Primary (Groq) error: {primary_error}\n"
                 f"Fallback (Gemini) error: {fallback_error}\n"
-                f"Check both OPENROUTER_API_KEY and GOOGLE_API_KEY in .env."
+                f"Check both GROQ_API_KEY and GOOGLE_API_KEY in .env."
             )
+
+
+def stream_agent_with_fallback(question: str):
+    """
+    Generator version of invoke_agent_with_fallback(), for token-by-token
+    rendering (e.g. st.write_stream in app.py). Yields:
+      ("token", str)   — an answer text delta, as it's generated
+      ("fell_back", str)  — emitted once, if the primary provider raised
+      ("done", {"provider": str, "tool_calls": [...], "usage": dict|None})
+      ("error", str)   — emitted only if BOTH providers fail
+
+    Streaming failures are handled the same way as invoke_agent_with_fallback:
+    if the primary provider raises (almost always immediately — an auth or
+    rate-limit error surfaces before any token is streamed, not mid-answer),
+    we fall back to a fresh agent on Gemini and stream from that instead.
+    """
+    messages = {"messages": [HumanMessage(content=question)]}
+
+    def run(llm, label):
+        agent = create_react_agent(llm, TOOLS, prompt=SYSTEM_PROMPT)
+        tool_calls = []
+        usage = None
+        for chunk, _metadata in agent.stream(messages, stream_mode="messages"):
+            if isinstance(chunk, ToolMessage):
+                tool_calls.append({"tool": chunk.name, "output": chunk.content})
+                continue
+            text = extract_message_text(chunk)
+            if text:
+                yield ("token", text)
+            if getattr(chunk, "usage_metadata", None):
+                usage = chunk.usage_metadata
+        yield ("done", {"provider": label, "tool_calls": tool_calls, "usage": usage})
+
+    try:
+        for event in run(build_primary_llm(), "Groq (Llama 3.3 70B)"):
+            yield event
+    except Exception as primary_error:
+        yield ("fell_back", str(primary_error))
+        try:
+            for event in run(build_fallback_llm(), "Google Gemini 2.5 Flash (fallback)"):
+                yield event
+        except Exception as fallback_error:
+            yield ("error", (
+                f"Both LLM providers failed.\n"
+                f"Primary (Groq) error: {primary_error}\n"
+                f"Fallback (Gemini) error: {fallback_error}\n"
+                f"Check both GROQ_API_KEY and GOOGLE_API_KEY in .env."
+            ))
 
 
 def ask(question: str) -> str:
     """Convenience function for one-off questions — uses the primary→fallback chain."""
     response = invoke_agent_with_fallback(question)
-    return response["result"]["messages"][-1].content
+    return extract_message_text(response["result"]["messages"][-1])
 
 
 if __name__ == "__main__":
-    # Quick smoke test — requires OPENROUTER_API_KEY (and optionally GOOGLE_API_KEY) in env
+    # Quick smoke test — requires GROQ_API_KEY (and optionally GOOGLE_API_KEY) in env
     test_questions = [
         "What SKUs are available?",
         "What's the demand forecast for SKU-1003 over the next 30 days, and how confident should I be in it?",
