@@ -16,6 +16,6 @@ venv/
 
 # Prophet/cmdstanpy artifacts
 *.pkl
-/tests
+/tests/_test_chroma_db
 /.env
 /.env.example

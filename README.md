@@ -113,6 +113,114 @@ tested in network-restricted environments (CI, sandboxes). It is **not** what th
 shipped app uses by default; semantic quality is lower than the real embedding
 model, so don't demo on it.
 
+## Baseline method comparison — SMA vs. ETS vs. Prophet
+
+Prophet remains the one production forecasting path — it's what `forecast()`,
+`run_scenario()`, and every agent/MCP tool actually use. `forecast_engine.py`
+also implements two lighter statistical methods, purely for comparison:
+
+- **SMA** (Simple Moving Average) — repeats the trailing 28-day average forward.
+  Deliberately naive; it's the floor every other method needs to beat.
+- **ETS** (Holt-Winters Exponential Smoothing, via `statsmodels`) — reacts to
+  trend and weekly seasonality, but without Prophet's holiday/regressor handling.
+
+`DemandForecastEngine.compare_baselines(sku_id, horizon_days=28)` backtests all
+three methods on the same holdout window and returns MAPE/WAPE for each, so
+"why Prophet and not something simpler" has evidence behind it rather than
+being asserted:
+
+```python
+from forecast_engine import DemandForecastEngine
+
+engine = DemandForecastEngine("data/demand_history.csv")
+engine.compare_baselines("SKU-1003", horizon_days=28)
+# {"sku_id": "SKU-1003", "horizon_days": 28,
+#  "methods": {"sma": {...}, "ets": {...}, "prophet": {...}}}
+```
+
+This isn't wired into the agent or MCP tools — it's a Phase 1 evaluation utility.
+
+## ML/DL evaluation — `ml_dl_evaluation.py` (Phase 3, evaluation-only)
+
+A separate module answers a different question than the comparison above: does
+a *heavier* model (classical ML, or a deep-learning approach) beat the Phase 1
+Prophet baseline enough to justify the added complexity — before committing
+engineering time to an in-house build, or evaluating a commercial platform?
+
+- **ML candidate** — scikit-learn's `HistGradientBoostingRegressor` on
+  lag/calendar features, standing in for XGBoost/LightGBM.
+- **"DL" candidate** — scikit-learn's `MLPRegressor` (a small feed-forward net),
+  standing in for a proper sequence model (LSTM / Temporal Fusion Transformer /
+  DeepAR). This project deliberately avoids adding a PyTorch/TensorFlow
+  dependency for an evaluation stub — same free-tier, no-heavy-install
+  philosophy as the LLM provider choices above. If this phase clears its
+  decision gate, swap `evaluate_dl()`'s model for a real sequence model; the
+  feature-engineering/scoring harness doesn't need to change.
+
+Both are lag-feature regressors, not sequence models — this is a lightweight
+comparison, not a production DL pipeline.
+
+```python
+from forecast_engine import DemandForecastEngine
+from ml_dl_evaluation import compare_to_baseline
+
+engine = DemandForecastEngine("data/demand_history.csv")
+compare_to_baseline("SKU-1003", engine, horizon_days=28)
+# {"sku_id": ..., "prophet_baseline": {...}, "ml": {...}, "dl": {...}}
+```
+
+Like the SMA/ETS comparison, this module is **not** called by `agent.py`,
+`mcp_server.py`, or `app.py` — it exists purely to generate the accuracy-lift
+evidence a real Phase 3 decision needs.
+
+### Reference — existing commercial forecasting platforms
+
+Before spending engineering time on a heavier in-house model, it's worth
+knowing what commercial demand-planning platforms already offer at enterprise
+scale — these are reference points for the Phase 3 build-vs-buy decision, not
+things this project tries to replicate:
+
+- **[Kinaxis](https://www.kinaxis.com)** (RapidResponse) — concurrent planning
+  with scenario simulation.
+- **[Blue Yonder](https://blueyonder.com)** — end-to-end supply chain platform
+  with ML-based demand forecasting.
+- **[o9 Solutions](https://o9solutions.com)** — AI-driven integrated business
+  planning on a graph-based data model.
+- **[Anaplan](https://www.anaplan.com)** — connected planning platform, often
+  used for the S&OP consensus/collaboration layer itself.
+
+## S&OP consensus workflow — `consensus.py`
+
+The PRD's Section 9 process (baseline → function adjustments → S&OP sign-off →
+consensus forecast) is implemented as its own deterministic, no-LLM module —
+same separation-of-concerns rule as everything else here. `ConsensusStore`
+persists two things to CSV under `data/`, so the audit trail survives app
+restarts:
+
+- **Adjustments** (`sop_adjustments.csv`) — one row per Sales/Marketing/Product
+  adjustment to the baseline, each with a **required** rationale. An adjustment
+  with no rationale, or from an unrecognized function, is rejected outright.
+- **Sign-offs** (`sop_signoffs.csv`) — marks a forecast cycle + SKU as final.
+  Once signed off, further adjustments to that cycle/SKU are rejected — the
+  number is locked until the next monthly cycle.
+
+`ConsensusStore.get_consensus(cycle, sku_id, baseline_total)` sums the recorded
+adjustments against the baseline to produce the consensus total:
+
+```python
+from consensus import ConsensusStore
+
+store = ConsensusStore(data_dir="data")
+store.add_adjustment("2026-07", "SKU-1003", "Sales", 120, "Confirmed bulk reorder.")
+store.get_consensus("2026-07", "SKU-1003", baseline_total=1000.0)
+# ConsensusResult(baseline_total=1000.0, consensus_total=1120.0, is_signed_off=False, ...)
+```
+
+The Streamlit app's **🤝 S&OP Consensus** tab is a thin UI over this same store —
+pick a cycle and SKU, submit an adjustment with rationale, and sign off once
+the number is agreed. Nothing here calls the LLM or the agent; it's pure
+bookkeeping, matching FR-5/FR-6/FR-8.
+
 ## MCP server — query PlanningCopilot from Claude Desktop directly
 
 `mcp_server.py` exposes all 5 tools over the Model Context Protocol, so you can
@@ -280,16 +388,22 @@ worth doing before quoting a MAPE/WAPE number in an interview.
 planning-copilot/
 ├── data/
 │   ├── generate_data.py      # synthetic demand data generator
-│   └── demand_history.csv    # generated output (run generate_data.py first)
+│   ├── demand_history.csv    # generated output (run generate_data.py first)
+│   ├── sop_adjustments.csv   # S&OP audit trail — created on first adjustment submitted
+│   └── sop_signoffs.csv      # S&OP audit trail — created on first sign-off
 ├── src/
-│   ├── forecast_engine.py    # deterministic core — Prophet, no LLM, fully unit-tested
+│   ├── forecast_engine.py    # deterministic core — Prophet (+ SMA/ETS comparison), no LLM, fully unit-tested
+│   ├── ml_dl_evaluation.py   # Phase 3 ML/DL evaluation (evaluation-only, not agent-wired)
 │   ├── knowledge_base.py     # ChromaDB vector store over planning docs — no LLM
+│   ├── consensus.py           # S&OP adjustments + sign-off bookkeeping — no LLM
 │   ├── agent.py                # LangGraph agent — tool-calling only, narrates results
 │   ├── mcp_server.py          # exposes the same 5 tools via MCP for Claude Desktop etc.
-│   ├── app.py                  # Streamlit dashboard — Forecast Explorer + chat
+│   ├── app.py                  # Streamlit dashboard — Overview, Explorer, S&OP Consensus, chat
 │   └── chroma_db/              # persisted vector index (auto-created on first run)
 ├── tests/
-│   ├── test_forecast_engine.py  # unit tests for the deterministic core
+│   ├── test_forecast_engine.py  # unit tests for the deterministic core (incl. SMA/ETS comparison)
+│   ├── test_ml_dl_evaluation.py # unit tests for the Phase 3 ML/DL evaluation module
+│   ├── test_consensus.py        # unit tests for the S&OP adjustments/sign-off workflow
 │   └── test_knowledge_base.py   # unit tests for retrieval (uses tfidf mode, no download)
 ├── requirements.txt
 ├── .env                         # you create this — see "LLM provider setup" above
@@ -315,6 +429,11 @@ planning-copilot/
 - **The vector store uses ChromaDB's local embedding model by default**, with a
   documented TF-IDF fallback used only for testing in network-restricted
   environments — see "The vector store" section above.
+- **Baseline method choice is backtested, not asserted.** `compare_baselines()`
+  in `forecast_engine.py` scores SMA, ETS, and Prophet on the same holdout
+  window; `ml_dl_evaluation.py` does the same for a classical-ML and a
+  "DL-lite" candidate. Neither is wired into the agent's tools — Prophet stays
+  the one production path until a Phase 3 decision explicitly changes that.
 - **The MCP server and the LangChain agent share one source of truth.** Both
   call the exact same `DemandForecastEngine` and `PlanningKnowledgeBase` instances —
   there's no risk of the two interfaces disagreeing about how a number or a

@@ -55,6 +55,14 @@ def get_kb() -> PlanningKnowledgeBase:
     return _kb
 
 
+def _tool_error(message: str) -> str:
+    """Standard error payload for a bad application-level input (e.g. an
+    unknown SKU) — returned as a normal tool result rather than raising, so
+    the calling MCP client sees a clean, structured error instead of a
+    server-side crash. Mirrors agent.py's _tool_error for the same reason."""
+    return json.dumps({"error": message})
+
+
 @mcp.tool()
 def list_available_skus() -> str:
     """Returns the list of SKU IDs available for demand forecasting."""
@@ -68,7 +76,10 @@ def get_forecast(sku_id: str, horizon_days: int = 30) -> str:
     backtested accuracy (MAPE/WAPE), recommended safety stock, and reorder
     point — all computed by Prophet, never estimated.
     """
-    result = get_engine().forecast(sku_id, horizon_days=horizon_days)
+    try:
+        result = get_engine().forecast(sku_id, horizon_days=horizon_days)
+    except ValueError as e:
+        return _tool_error(str(e))
     return json.dumps({
         "sku_id": result.sku_id,
         "horizon_days": horizon_days,
@@ -90,11 +101,14 @@ def run_what_if_scenario(sku_id: str, horizon_days: int = 30, extra_promo_days: 
     re-computes rather than estimating the answer.
     """
     engine = get_engine()
-    baseline = engine.forecast(sku_id, horizon_days=horizon_days)
-    scenario = engine.run_scenario(
-        sku_id, horizon_days=horizon_days,
-        extra_promo_days=extra_promo_days, lead_time_override=lead_time_days,
-    )
+    try:
+        baseline = engine.forecast(sku_id, horizon_days=horizon_days)
+        scenario = engine.run_scenario(
+            sku_id, horizon_days=horizon_days,
+            extra_promo_days=extra_promo_days, lead_time_override=lead_time_days,
+        )
+    except ValueError as e:
+        return _tool_error(str(e))
     baseline_total = float(baseline.forecast_df["yhat"].sum())
     scenario_total = float(scenario.forecast_df["yhat"].sum())
     return json.dumps({
@@ -114,7 +128,11 @@ def check_demand_exception(sku_id: str, threshold_pct: float = 15.0) -> str:
     Checks whether a SKU's recent actual demand deviated significantly from
     the statistical forecast — the trigger for an S&OP exception review.
     """
-    return json.dumps(get_engine().detect_exceptions(sku_id, threshold_pct=threshold_pct))
+    try:
+        result = get_engine().detect_exceptions(sku_id, threshold_pct=threshold_pct)
+    except ValueError as e:
+        return _tool_error(str(e))
+    return json.dumps(result)
 
 
 @mcp.tool()

@@ -73,6 +73,15 @@ def test_exception_detection_returns_native_bool(engine):
     assert isinstance(result["is_exception"], bool)
 
 
+def test_detect_exceptions_unknown_sku_raises(engine):
+    """detect_exceptions must validate sku_id the same way forecast() and
+    get_sku_history() do — otherwise an unknown SKU falls through to Prophet
+    fitting on an empty/near-empty frame and fails with an obscure error
+    instead of a clean ValueError the caller can handle."""
+    with pytest.raises(ValueError):
+        engine.detect_exceptions("SKU-9999")
+
+
 def test_run_scenario_matches_forecast_with_same_params(engine):
     """run_scenario is a convenience wrapper — verify it produces the same
     numbers as calling forecast() directly with equivalent parameters."""
@@ -84,3 +93,34 @@ def test_run_scenario_matches_forecast_with_same_params(engine):
     assert direct.forecast_df["yhat"].sum() == pytest.approx(
         via_scenario.forecast_df["yhat"].sum(), rel=1e-6
     )
+
+
+# ── PRD Phase 1 — SMA/ETS baseline comparison ────────────────────────────────
+
+def test_get_sku_history_returns_expected_columns(engine):
+    history = engine.get_sku_history("SKU-1003")
+    assert list(history.columns) == ["ds", "y", "on_promotion"]
+    assert len(history) > 0
+
+
+def test_get_sku_history_unknown_sku_raises(engine):
+    with pytest.raises(ValueError):
+        engine.get_sku_history("SKU-9999")
+
+
+def test_compare_baselines_includes_all_three_methods(engine):
+    result = engine.compare_baselines("SKU-1003", horizon_days=28)
+    assert set(result["methods"].keys()) == {"sma", "ets", "prophet"}
+    for method, scores in result["methods"].items():
+        assert "error" in scores or ("mape_pct" in scores and "wape_pct" in scores), (
+            f"{method} result missing expected score keys: {scores}"
+        )
+
+
+def test_compare_baselines_scores_are_non_negative(engine):
+    result = engine.compare_baselines("SKU-1005", horizon_days=28)
+    for method, scores in result["methods"].items():
+        if "error" in scores:
+            continue
+        assert scores["mape_pct"] >= 0
+        assert scores["wape_pct"] >= 0

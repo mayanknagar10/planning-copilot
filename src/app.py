@@ -1,13 +1,16 @@
 """
 app.py — Streamlit dashboard for PlanningCopilot.
 
-Three tabs:
+Four tabs:
   1. Portfolio Overview — fixed-horizon snapshot across all SKUs: KPI tiles,
      a category-level demand rollup, and a per-SKU status table. Pure numbers
      from forecast_engine, no LLM.
   2. Forecast Explorer — Single SKU deep dive, or Compare SKUs side by side.
      Pure numbers from forecast_engine, no LLM.
-  3. Planning Assistant — chat with the agent for explanations, what-if
+  3. S&OP Consensus — Sales/Marketing/Product submit baseline adjustments with
+     rationale, reconciled into a signed-off consensus number (PRD Section 9,
+     FR-5/FR-6). Backed by consensus.py; pure bookkeeping, no LLM.
+  4. Planning Assistant — chat with the agent for explanations, what-if
      scenarios, and exception narratives. Every number the agent states here
      traces back to a tool call, shown in an expandable "trace" for transparency.
 """
@@ -16,6 +19,7 @@ import os
 import sys
 import json
 import time
+from datetime import date
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -27,10 +31,12 @@ load_dotenv()  # reads .env into os.environ — must run before checking API key
 sys.path.insert(0, str(Path(__file__).parent))
 
 from forecast_engine import DemandForecastEngine
+from consensus import ConsensusStore, FUNCTIONS
 
 st.set_page_config(page_title="PlanningCopilot", page_icon="📦", layout="wide")
 
 DATA_PATH = str(Path(__file__).parent.parent / "data" / "demand_history.csv")
+SOP_DATA_DIR = str(Path(__file__).parent.parent / "data")
 
 # ── Validated color palette (fixed categorical order — color follows the
 # entity's identity, never the current selection/filter) ───────────────────
@@ -57,6 +63,11 @@ def get_agent_module():
     # Imported lazily so the Forecast Explorer tab works even without API keys set
     import agent as agent_module
     return agent_module
+
+
+@st.cache_resource
+def get_consensus_store():
+    return ConsensusStore(data_dir=SOP_DATA_DIR)
 
 
 @st.cache_resource
@@ -141,8 +152,8 @@ with st.sidebar:
         if last_provider:
             st.caption(f"Last answered by: {last_provider}")
 
-tab_overview, tab_explorer, tab_chat = st.tabs(
-    ["🧭 Portfolio Overview", "📊 Forecast Explorer", "💬 Planning Assistant"]
+tab_overview, tab_explorer, tab_consensus, tab_chat = st.tabs(
+    ["🧭 Portfolio Overview", "📊 Forecast Explorer", "🤝 S&OP Consensus", "💬 Planning Assistant"]
 )
 
 # ── Tab 1: Portfolio Overview ───────────────────────────────────────────────
@@ -351,7 +362,94 @@ with tab_explorer:
                     use_container_width=True,
                 )
 
-# ── Tab 3: Planning Assistant (chat) ────────────────────────────────────────
+# ── Tab 3: S&OP Consensus ────────────────────────────────────────────────
+
+with tab_consensus:
+    st.caption(
+        "Sales, Marketing, and Product submit adjustments to the baseline with "
+        "documented rationale; the S&OP lead reconciles them into a signed-off "
+        "consensus number. Every adjustment and sign-off is persisted for audit."
+    )
+
+    store = get_consensus_store()
+
+    col_cycle, col_sku = st.columns([1, 1])
+    with col_cycle:
+        default_cycle = date.today().strftime("%Y-%m")
+        cycle = st.text_input("Forecast cycle", value=default_cycle, key="sop_cycle",
+                                help="Free-form label for the monthly forecast cycle being reconciled, e.g. 2026-07.")
+    with col_sku:
+        consensus_sku = st.selectbox("SKU", sku_list, key="sop_sku")
+
+    baseline_result = get_forecast_cached(engine, consensus_sku, OVERVIEW_HORIZON_DAYS, OVERVIEW_LEAD_TIME_DAYS)
+    baseline_total = float(baseline_result.forecast_df["yhat"].sum())
+
+    cr = store.get_consensus(cycle, consensus_sku, baseline_total)
+
+    kpi_cols = st.columns(3)
+    with kpi_cols[0]:
+        with st.container(border=True):
+            st.metric(f"Baseline ({OVERVIEW_HORIZON_DAYS}d)", f"{cr.baseline_total:,.0f} units")
+    with kpi_cols[1]:
+        with st.container(border=True):
+            st.metric("Net adjustment", f"{cr.consensus_total - cr.baseline_total:+,.0f} units")
+    with kpi_cols[2]:
+        with st.container(border=True):
+            st.metric("Consensus forecast", f"{cr.consensus_total:,.0f} units")
+
+    if cr.is_signed_off:
+        st.success(f"✅ Signed off by **{cr.signed_off_by}** at {cr.signed_off_at} — adjustments are locked for this cycle.")
+    else:
+        st.info("Not yet signed off — Sales, Marketing, and Product can still submit adjustments.")
+
+    st.markdown("#### Submit an adjustment")
+    with st.form("adjustment_form", clear_on_submit=True):
+        form_cols = st.columns([1, 1, 3])
+        with form_cols[0]:
+            function = st.selectbox("Function", FUNCTIONS, key="sop_function")
+        with form_cols[1]:
+            delta_units = st.number_input("Delta (units)", value=0.0, step=10.0, key="sop_delta")
+        with form_cols[2]:
+            rationale = st.text_input("Rationale (required)", key="sop_rationale",
+                                        placeholder="e.g. Regional account confirmed a bulk reorder")
+        submitted = st.form_submit_button("Submit adjustment", disabled=cr.is_signed_off)
+
+        if submitted:
+            try:
+                store.add_adjustment(cycle, consensus_sku, function, delta_units, rationale)
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+    st.markdown("#### Audit trail — adjustments this cycle")
+    if cr.adjustments:
+        adj_df = pd.DataFrame(cr.adjustments)
+        st.dataframe(
+            adj_df[["function", "delta_units", "rationale", "submitted_at"]],
+            column_config={
+                "function": st.column_config.TextColumn("Function"),
+                "delta_units": st.column_config.NumberColumn("Delta", format="%+.0f"),
+                "rationale": st.column_config.TextColumn("Rationale", width="large"),
+                "submitted_at": st.column_config.TextColumn("Submitted at"),
+            },
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.caption("No adjustments submitted yet for this cycle/SKU.")
+
+    if not cr.is_signed_off:
+        st.markdown("#### S&OP sign-off")
+        signoff_cols = st.columns([2, 1])
+        with signoff_cols[0]:
+            signed_off_by = st.text_input("Signing off as", value="S&OP Lead", key="sop_signoff_name")
+        with signoff_cols[1]:
+            st.write("")
+            if st.button("Sign off consensus forecast", type="primary", use_container_width=True):
+                store.sign_off(cycle, consensus_sku, signed_off_by=signed_off_by or "S&OP Lead")
+                st.rerun()
+
+# ── Tab 4: Planning Assistant (chat) ────────────────────────────────────────
 
 with tab_chat:
     header_col, clear_col = st.columns([5, 1])

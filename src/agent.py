@@ -101,6 +101,25 @@ def get_kb() -> PlanningKnowledgeBase:
     return _kb
 
 
+def _tool_error(message: str) -> str:
+    """
+    Standard error payload for a tool call that failed for an application-level
+    reason (e.g. an unknown SKU) rather than an LLM-provider failure.
+
+    WHY THIS EXISTS: LangGraph's ToolNode only catches its own internal
+    ToolInvocationError by default — any other exception raised inside a tool
+    (e.g. forecast_engine.py's `ValueError("Unknown SKU: ...")`) propagates
+    all the way out of agent.invoke(), which invoke_agent_with_fallback then
+    misreads as a primary-provider failure and retries on the fallback LLM —
+    for a problem no LLM provider could ever have fixed. Catching the
+    application error here and returning it as a normal tool result instead
+    lets the agent see it, react in-conversation (e.g. call list_available_skus
+    and ask the planner to pick one), and answer without ever needing a
+    provider fallback.
+    """
+    return json.dumps({"error": message})
+
+
 @tool
 def list_available_skus() -> str:
     """Returns the list of SKU IDs available for forecasting."""
@@ -115,7 +134,10 @@ def get_forecast(sku_id: str, horizon_days: int = 30) -> str:
     and reorder point. Use this for any question about expected future demand,
     inventory recommendations, or forecast accuracy.
     """
-    result = get_engine().forecast(sku_id, horizon_days=horizon_days)
+    try:
+        result = get_engine().forecast(sku_id, horizon_days=horizon_days)
+    except ValueError as e:
+        return _tool_error(str(e))
     return json.dumps({
         "sku_id": result.sku_id,
         "horizon_days": horizon_days,
@@ -139,11 +161,14 @@ def run_what_if_scenario(sku_id: str, horizon_days: int = 30, extra_promo_days: 
     time grows to 21 days" (lead_time_days=21). NEVER estimate a what-if answer
     yourself — always call this tool, since it reruns the actual model.
     """
-    baseline = get_engine().forecast(sku_id, horizon_days=horizon_days)
-    scenario = get_engine().run_scenario(
-        sku_id, horizon_days=horizon_days,
-        extra_promo_days=extra_promo_days, lead_time_override=lead_time_days,
-    )
+    try:
+        baseline = get_engine().forecast(sku_id, horizon_days=horizon_days)
+        scenario = get_engine().run_scenario(
+            sku_id, horizon_days=horizon_days,
+            extra_promo_days=extra_promo_days, lead_time_override=lead_time_days,
+        )
+    except ValueError as e:
+        return _tool_error(str(e))
     return json.dumps({
         "sku_id": sku_id,
         "scenario_params": {"extra_promo_days": extra_promo_days, "lead_time_days": lead_time_days},
@@ -167,7 +192,10 @@ def check_demand_exception(sku_id: str, threshold_pct: float = 15.0) -> str:
     answer questions like "any exceptions I should know about for SKU X"
     or when drafting an S&OP exception summary.
     """
-    result = get_engine().detect_exceptions(sku_id, threshold_pct=threshold_pct)
+    try:
+        result = get_engine().detect_exceptions(sku_id, threshold_pct=threshold_pct)
+    except ValueError as e:
+        return _tool_error(str(e))
     return json.dumps(result)
 
 
@@ -226,9 +254,13 @@ CRITICAL RULES YOU MUST FOLLOW:
    reason about hypothetical demand changes without re-running the model.
 3. When you present numbers, always mention the forecast accuracy (MAPE/WAPE)
    from the tool output so the planner knows how much to trust the figure.
-4. If a planner's question is ambiguous (e.g. they say "the beverage SKU" when
-   there are two), ask which SKU they mean rather than guessing — call
-   list_available_skus first if you need to check.
+4. If a planner's question doesn't name a specific SKU, or is ambiguous (e.g.
+   they say "the beverage SKU" when there are two), do NOT call a forecast
+   tool with a placeholder or guessed sku_id (e.g. "please specify the SKU").
+   Instead call list_available_skus and ask the planner which one they mean.
+   If a tool call ever comes back with an {"error": ...} result (e.g. an
+   unknown SKU), don't retry blindly — tell the planner what went wrong and
+   offer the valid options from list_available_skus.
 5. Be concise. Planners are busy — lead with the number and the recommendation,
    then briefly explain the driver.
 6. When drafting an S&OP exception narrative, be specific about the deviation

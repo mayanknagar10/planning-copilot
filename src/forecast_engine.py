@@ -7,6 +7,19 @@ statistical forecasting library. The LLM layer (agent.py) sits ON TOP of this
 module and is only allowed to call these functions and narrate their output —
 it never estimates a demand number itself. This separation is the core
 engineering decision behind this whole project.
+
+PRD PHASE 1 — BASELINE METHOD COMPARISON:
+Prophet is the production baseline (used by forecast()/run_scenario(), which
+agent.py and mcp_server.py call). This module also implements the two lighter
+statistical methods called out in the PRD's Phase 1 (SMA, ETS), purely so
+`compare_baselines()` can backtest all three on the same holdout window and
+answer "which statistical method actually wins" with evidence rather than by
+default. SMA/ETS are NOT wired into the agent's tools — Prophet remains the
+one production forecasting path; SMA/ETS exist only for this comparison.
+
+See ml_dl_evaluation.py for the PRD's Phase 3 (ML/DL evaluation) — a separate,
+also-not-production-wired module, kept apart from this file since it answers a
+different question (does a heavier model beat this Phase 1 baseline at all).
 """
 
 from dataclasses import dataclass
@@ -45,6 +58,17 @@ class DemandForecastEngine:
 
     def list_skus(self) -> list[str]:
         return sorted(self.df["sku_id"].unique().tolist())
+
+    def get_sku_history(self, sku_id: str) -> pd.DataFrame:
+        """
+        Public accessor for a SKU's prepared (ds, y, on_promotion) history.
+        Exists so external evaluation code — e.g. ml_dl_evaluation.py's Phase 3
+        ML/DL comparison — trains on exactly the same data Prophet does, with
+        no separate data path that could quietly drift out of sync.
+        """
+        if sku_id not in self.df["sku_id"].unique():
+            raise ValueError(f"Unknown SKU: {sku_id}")
+        return self._prepare_sku_data(sku_id)
 
     def _prepare_sku_data(self, sku_id: str) -> pd.DataFrame:
         sku_df = self.df[self.df["sku_id"] == sku_id].copy()
@@ -188,6 +212,9 @@ class DemandForecastEngine:
         a prior forecast would have predicted — the trigger for an "exception
         narrative" in the S&OP report. Pure statistics, no LLM.
         """
+        if sku_id not in self.df["sku_id"].unique():
+            raise ValueError(f"Unknown SKU: {sku_id}")
+
         sku_df = self._prepare_sku_data(sku_id)
         recent = sku_df.tail(14)
 
@@ -211,6 +238,78 @@ class DemandForecastEngine:
             "is_exception": bool(abs(deviation_pct) > threshold_pct),
         }
 
+    # ── PRD Phase 1 — SMA/ETS baseline comparison ───────────────────────────
+    # These two methods back compare_baselines() below. Neither is called by
+    # forecast()/run_scenario() and neither is exposed as an agent tool —
+    # Prophet stays the one production path. They exist only so the "which
+    # statistical method should the baseline be" question has a backtested
+    # answer instead of being picked by feel.
+
+    @staticmethod
+    def _score(actual: np.ndarray, pred: np.ndarray) -> dict:
+        """Shared MAPE/WAPE scorer so every baseline method in this file — and
+        ml_dl_evaluation.py's Phase 3 methods — are graded identically."""
+        pred = np.maximum(np.asarray(pred, dtype=float), 0)
+        actual = np.asarray(actual, dtype=float)
+        nonzero = actual > 0
+        mape = (
+            float(np.mean(np.abs((actual[nonzero] - pred[nonzero]) / actual[nonzero])) * 100)
+            if nonzero.any() else float("nan")
+        )
+        wape = (
+            float(np.sum(np.abs(actual - pred)) / np.sum(actual) * 100)
+            if actual.sum() > 0 else float("nan")
+        )
+        return {"mape_pct": round(mape, 2), "wape_pct": round(wape, 2)}
+
+    def _sma_predict(self, train: pd.DataFrame, horizon_days: int, window: int = 28) -> np.ndarray:
+        """Simple Moving Average: repeats the trailing `window`-day average
+        forward for the full horizon. Deliberately naive — this is the floor
+        every other method needs to beat, not a real candidate baseline."""
+        avg = train["y"].tail(window).mean()
+        return np.full(horizon_days, avg)
+
+    def _ets_predict(self, train: pd.DataFrame, horizon_days: int) -> np.ndarray:
+        """Holt-Winters Exponential Smoothing with weekly seasonality — a step
+        up from SMA that reacts to trend and the weekend-lift pattern in the
+        data, but without Prophet's holiday/regressor handling."""
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+        series = train.set_index("ds")["y"].asfreq("D")
+        series = series.interpolate().bfill().ffill()  # fill any calendar gaps
+        model = ExponentialSmoothing(
+            series, trend="add", seasonal="add", seasonal_periods=7,
+            initialization_method="estimated",
+        ).fit()
+        return model.forecast(horizon_days).to_numpy()
+
+    def compare_baselines(self, sku_id: str, horizon_days: int = 28) -> dict:
+        """
+        Backtests SMA, ETS, and the production Prophet model on the SAME
+        holdout window (train on all but the last `horizon_days`, score
+        against the actuals) and returns MAPE/WAPE for each. This is the
+        evidence behind the PRD's Phase 1 "SMA vs. ETS vs. Prophet" comparison
+        — it does not change which method forecast()/run_scenario() use.
+        """
+        if sku_id not in self.df["sku_id"].unique():
+            raise ValueError(f"Unknown SKU: {sku_id}")
+
+        sku_df = self._prepare_sku_data(sku_id)
+        train, test = sku_df.iloc[:-horizon_days], sku_df.iloc[-horizon_days:]
+        actual = test["y"].to_numpy()
+
+        methods = {"sma": self._score(actual, self._sma_predict(train, horizon_days))}
+
+        try:
+            methods["ets"] = self._score(actual, self._ets_predict(train, horizon_days))
+        except Exception as e:
+            methods["ets"] = {"error": str(e)}
+
+        prophet_mape, prophet_wape = self._backtest(sku_df, horizon_days=horizon_days)
+        methods["prophet"] = {"mape_pct": prophet_mape, "wape_pct": prophet_wape}
+
+        return {"sku_id": sku_id, "horizon_days": horizon_days, "methods": methods}
+
 
 if __name__ == "__main__":
     engine = DemandForecastEngine("../data/demand_history.csv")
@@ -222,3 +321,9 @@ if __name__ == "__main__":
     print(f"Safety stock: {result.safety_stock} units")
     print(f"Reorder point: {result.reorder_point} units")
     print(result.forecast_df.head())
+
+    comparison = engine.compare_baselines("SKU-1003", horizon_days=28)
+    print(f"\nPhase 1 baseline comparison for {comparison['sku_id']} "
+          f"({comparison['horizon_days']}-day holdout):")
+    for method, scores in comparison["methods"].items():
+        print(f"  {method:8s} {scores}")
