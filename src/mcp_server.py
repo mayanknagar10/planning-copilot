@@ -23,6 +23,7 @@ Or configure in Claude Desktop's claude_desktop_config.json (see README):
 """
 
 import json
+from pathlib import Path
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
@@ -36,6 +37,13 @@ from knowledge_base import PlanningKnowledgeBase
 
 mcp = FastMCP("planning-copilot")
 
+# Resolved from this file's own location, not the process's working directory —
+# Claude Desktop launches this subprocess with an arbitrary cwd, so a relative
+# "../data/..." path silently breaks depending on where it happens to be started from.
+_SRC_DIR = Path(__file__).parent
+_DATA_PATH = str(_SRC_DIR.parent / "data" / "demand_history.csv")
+_CHROMA_DIR = str(_SRC_DIR / "chroma_db")
+
 _engine: Optional[DemandForecastEngine] = None
 _kb: Optional[PlanningKnowledgeBase] = None
 
@@ -43,14 +51,14 @@ _kb: Optional[PlanningKnowledgeBase] = None
 def get_engine() -> DemandForecastEngine:
     global _engine
     if _engine is None:
-        _engine = DemandForecastEngine("../data/demand_history.csv")
+        _engine = DemandForecastEngine(_DATA_PATH)
     return _engine
 
 
 def get_kb() -> PlanningKnowledgeBase:
     global _kb
     if _kb is None:
-        _kb = PlanningKnowledgeBase(persist_dir="./chroma_db", embedding_mode="default")
+        _kb = PlanningKnowledgeBase(persist_dir=_CHROMA_DIR, embedding_mode="default")
         _kb.build()
     return _kb
 

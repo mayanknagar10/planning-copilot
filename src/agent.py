@@ -21,6 +21,7 @@ LangChain-native chat models, so swapping either is a one-line change.
 
 import os
 import json
+from pathlib import Path
 from typing import Optional
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -32,6 +33,14 @@ load_dotenv()  # reads .env into os.environ — needed when agent.py is run/impo
 
 from forecast_engine import DemandForecastEngine
 from knowledge_base import PlanningKnowledgeBase
+
+# Resolved from this file's own location, NOT the process's working directory —
+# "../data/..." only worked if you happened to launch from src/. app.py (run via
+# Streamlit Cloud, which launches from the repo root) or an MCP client (which
+# can launch mcp_server.py from anywhere) would otherwise hit a FileNotFoundError.
+_SRC_DIR = Path(__file__).parent
+_DATA_PATH = str(_SRC_DIR.parent / "data" / "demand_history.csv")
+_CHROMA_DIR = str(_SRC_DIR / "chroma_db")
 
 # ── LLM setup: primary + fallback ────────────────────────────────────────────
 
@@ -86,7 +95,7 @@ _kb: Optional[PlanningKnowledgeBase] = None
 def get_engine() -> DemandForecastEngine:
     global _engine
     if _engine is None:
-        _engine = DemandForecastEngine("../data/demand_history.csv")
+        _engine = DemandForecastEngine(_DATA_PATH)
     return _engine
 
 
@@ -96,7 +105,7 @@ def get_kb() -> PlanningKnowledgeBase:
         # embedding_mode="default" uses Chroma's built-in local embedding model
         # (free, one-time ~90MB download, then fully offline). See
         # knowledge_base.py docstring for the "tfidf" testing fallback.
-        _kb = PlanningKnowledgeBase(persist_dir="./chroma_db", embedding_mode="default")
+        _kb = PlanningKnowledgeBase(persist_dir=_CHROMA_DIR, embedding_mode="default")
         _kb.build()  # no-ops if already ingested
     return _kb
 
