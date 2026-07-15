@@ -28,6 +28,19 @@ from dotenv import load_dotenv
 
 load_dotenv()  # reads .env into os.environ — must run before checking API keys below
 
+# Streamlit Community Cloud has no .env file at all — secrets pasted into its
+# "Secrets" dashboard panel are exposed via st.secrets, NOT os.environ. Every
+# API-key check in this app (and in agent.py) reads os.environ, so bridge any
+# secret found there into os.environ if it isn't already set. Wrapped in
+# try/except because st.secrets raises if no secrets.toml exists at all (the
+# normal case for local dev, where .env already covers this).
+try:
+    for _key in ("GROQ_API_KEY", "GOOGLE_API_KEY"):
+        if not os.environ.get(_key) and _key in st.secrets:
+            os.environ[_key] = st.secrets[_key]
+except Exception:
+    pass
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from forecast_engine import DemandForecastEngine
